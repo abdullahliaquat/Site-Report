@@ -102,7 +102,7 @@ const storage = multer.diskStorage({
 const upload = multer({ 
   storage: storage,
   limits: {
-    fileSize: 2000 * 1024 * 1024, // 10MB limit
+    fileSize: 5000 * 1024 * 1024, // 10MB limit
   },
   fileFilter: (req, file, cb) => {
     console.log('Checking file type:', file.mimetype);
@@ -152,20 +152,16 @@ async function speechToText(fileBuffer) {
   }
 }
 
-async function generateReportContent(transcription, photoPaths = []) {
+async function generateReportContent(photoDescriptions = []) {
   try {
-    console.log('Generating report content from transcription...');
+    console.log('Generating report content from photo descriptions...');
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
+    // Compose a prompt that asks Gemini to generate a dynamic, bolded heading based on the issues described in the photos
     let photoSection = '';
-    let allDescriptions = [];
-    for (let i = 0; i < photoPaths.length; i++) {
-      const fname = photoPaths[i].split(/[\\/]/).pop();
-      const description = await getPhotoDescription(photoPaths[i]);
-      allDescriptions.push(description);
-      photoSection += `\nPhoto ${i + 1}:\nDescription: ${description}`;
-    }
-    // Compose a prompt that asks Gemini to generate a dynamic, bolded heading based on the issue
-    const prompt = `You are a professional property inspector. Analyze the following voice note transcription and the provided list of photo descriptions.\n\nGenerate a professional, concise, and bolded heading for the report that summarizes the main issue(s) described. Do NOT use any hardcoded or generic text.\n\nFor each photo, generate a detailed, professional report section with the following fields (all fields must be present for each photo, and all field label's headings must be bolded):\n\n- Problem Description\n- Recommended Solution\n- Priority Level (High/Medium/Low)\n- Estimated Cost Range\n- Safety Concerns\n\nUse clear, and professional language. Do NOT use asterisks, markdown, or any special characters for formatting. Use bolded headings and field labels (e.g., Problem Description:) for each section.\n\n${photoSection}\n\nTranscription: "${transcription}"\n\nFormat the report as follows:\n1. Start with the bolded heading for the report.\n2. For each photo, provide a bolded section heading (Photo X: <filename>) and the bolded field labels.\n3. Do not use any markdown or asterisks.`;
+    photoDescriptions.forEach((photo, i) => {
+      photoSection += `\nPhoto ${i + 1}:\nDescription: ${photo.description}`;
+    });
+    const prompt = `You are a professional property inspector. Analyze the following list of photo descriptions.\n\nGenerate a professional, concise, and bolded heading for the report that summarizes the main issue(s) described. Do NOT use any hardcoded or generic text.\n\nFor each photo, generate a detailed, professional report section with the following fields (all fields must be present for each photo, and all field label's headings must be bolded):\n\n- Problem Description\n- Recommended Solution\n- Priority Level (High/Medium/Low)\n- Estimated Cost Range\n- Safety Concerns\n\nUse clear, and professional language. Do NOT use asterisks, markdown, or any special characters for formatting. Use bolded headings and field labels (e.g., Problem Description:) for each section.\n\n${photoSection}\n\nFormat the report as follows:\n1. Start with the bolded heading for the report.\n2. For each photo, provide a bolded section heading (Photo X: <filename>) and the bolded field labels.\n3. Do not use any markdown or asterisks.`;
     const result = await model.generateContent(prompt);
     const response = await result.response;
     const text = response.text();
@@ -177,61 +173,80 @@ async function generateReportContent(transcription, photoPaths = []) {
   }
 }
 
-async function getPhotoDescription(photoPath) {
-  try {
-    const imageBuffer = fs.readFileSync(photoPath);
-    const response = await axios.post(
-      'https://api-inference.huggingface.co/models/nlpconnect/vit-gpt2-image-captioning',
-      imageBuffer,
-      {
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'Authorization': `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
-          'Accept': 'application/json'
-        }
-      }
-    );
-    // The response is an array of objects with a 'generated_text' field
-    if (Array.isArray(response.data) && response.data.length > 0 && response.data[0].generated_text) {
-      return response.data[0].generated_text;
-    } else {
-      return 'No description available.';
-    }
-  } catch (error) {
-    console.error('Huggingface image captioning error for', photoPath, error.response?.data || error.message);
-    return 'No description available (Huggingface API error).';
-  }
-}
-
 // Endpoints
 // 1. Create new report
-app.post('/api/reports', upload.array('photos', 12), async (req, res) => {
+app.post('/api/reports', upload.array('photos', 20), async (req, res) => {
   try {
     console.log('Received report creation request');
     console.log('Request body:', req.body);
     console.log('Request files:', req.files);
 
-    const { jobName, clientName, address, date } = req.body;
-    
+    const { jobName, clientName, address, date, photoDescriptions = '[]' } = req.body;
+    let parsedDescriptions = [];
+    try {
+      parsedDescriptions = JSON.parse(photoDescriptions);
+    } catch (e) {
+      parsedDescriptions = [];
+    }
     if (!jobName || !clientName || !address) {
       console.error('Missing required fields:', { jobName, clientName, address });
       return res.status(400).json({ error: 'Missing required fields' });
     }
-
-    // Store all photo paths
-    const photoPaths = req.files ? req.files.map(f => f.path) : [];
-
+    // Enforce 1-20 photos
+    if (!req.files || req.files.length < 1 || req.files.length > 20) {
+      return res.status(400).json({ error: 'You must upload between 1 and 20 photos.' });
+    }
+    if (!Array.isArray(parsedDescriptions) || parsedDescriptions.length !== req.files.length) {
+      return res.status(400).json({ error: 'photoDescriptions array must match number of uploaded files.' });
+    }
+    // Process each photo and its description
+    const photos = [];
+    for (let idx = 0; idx < req.files.length; idx++) {
+      const f = req.files[idx];
+      const desc = parsedDescriptions[idx] || {};
+      let description = desc.description || '';
+      let type = desc.type || 'text';
+      let transcription = '';
+      // Validate file type matches description type
+      if (type === 'voice') {
+        if (!f.mimetype.startsWith('audio/')) {
+          return res.status(400).json({ error: `File ${f.originalname} is not an audio file but type is set to 'voice'.` });
+        }
+        // Transcribe the audio file
+        try {
+          const fileBuffer = fs.readFileSync(f.path);
+          const transcriptResult = await speechToText(fileBuffer);
+          transcription = transcriptResult.text || '';
+          description = transcription;
+        } catch (err) {
+          console.error('Error transcribing audio for photo', f.path, err);
+          transcription = '';
+        }
+      } else if (type === 'text') {
+        if (!f.mimetype.startsWith('image/')) {
+          return res.status(400).json({ error: `File ${f.originalname} is not an image file but type is set to 'text'.` });
+        }
+      } else {
+        return res.status(400).json({ error: `Invalid type for photo at index ${idx}. Must be 'voice' or 'text'.` });
+      }
+      photos.push({
+        path: f.path,
+        description,
+        type,
+        transcription
+      });
+    }
     const report = {
       id: Date.now().toString(),
       jobName,
       clientName,
       address,
       date: date || new Date().toISOString().split('T')[0],
-      photos: photoPaths,
+      photos,
       status: 'draft',
-      createdAt: new Date()
+      createdAt: new Date(),
+      aiReport: null // Will be filled after AI analysis
     };
-
     console.log('Created report:', report);
     reports.push(report);
     res.status(201).json(report);
@@ -241,69 +256,7 @@ app.post('/api/reports', upload.array('photos', 12), async (req, res) => {
   }
 });
 
-// 2. Add voice note to report
-app.post('/api/reports/:id/voice', upload.single('audio'), async (req, res) => {
-  try {
-    console.log('Processing voice note for report:', req.params.id);
-    console.log('Request file:', req.file);
-    console.log('Request body:', req.body);
-
-    const report = reports.find(r => r.id === req.params.id);
-    if (!report) {
-      console.error('Report not found:', req.params.id);
-      return res.status(404).json({ error: 'Report not found' });
-    }
-
-    if (!req.file) {
-      console.error('No audio file provided');
-      return res.status(400).json({ error: 'No audio file provided' });
-    }
-
-    console.log('Reading audio file from:', req.file.path);
-    const fileBuffer = fs.readFileSync(req.file.path);
-    console.log('Audio file size:', fileBuffer.length);
-
-    console.log('Converting speech to text...');
-    const transcription = await speechToText(fileBuffer);
-    console.log('Transcription successful:', transcription);
-
-    // Initialize voiceNote object with transcription
-    const voiceNote = {
-      audioPath: req.file.path,
-      transcription: transcription.text,
-      problemDescription: req.body.problemDescription,
-      recommendedSolution: req.body.recommendedSolution,
-      processedAt: new Date()
-    };
-
-    try {
-      console.log('Generating report content...');
-      const elaboratedText = await generateReportContent(transcription.text, report.photos);
-      console.log('Report content generated successfully');
-      voiceNote.elaboratedText = elaboratedText;
-    } catch (error) {
-      console.error('Error generating report content:', error);
-      // Continue even if Gemini API fails
-      voiceNote.elaboratedText = 'AI analysis could not be generated. Please try again later.';
-    }
-
-    report.voiceNote = voiceNote;
-    console.log('Voice note processing completed successfully');
-    res.json(report);
-  } catch (error) {
-    console.error('Error processing voice note:', {
-      message: error.message,
-      stack: error.stack,
-      code: error.code
-    });
-    res.status(500).json({ 
-      error: 'Failed to process voice note',
-      details: error.message 
-    });
-  }
-});
-
-// 3. Generate PDF
+// 2. Generate PDF
 app.get('/api/reports/:id/pdf', async (req, res) => {
   try {
     console.log('Generating PDF for report:', req.params.id);
@@ -326,99 +279,154 @@ app.get('/api/reports/:id/pdf', async (req, res) => {
 
     doc.pipe(writeStream);
 
+    // Helper for page numbers
+    function addPageNumber(doc, pageNum, totalPages) {
+      doc.fontSize(10).fillColor('#222').text(`Page ${pageNum} of ${totalPages}`, doc.page.width - 120, 20, { align: 'right' });
+    }
+
     try {
-      // Cover Page with dynamic heading
-      doc.addPage();
-      // Extract the first line as the heading (Gemini output should start with the heading)
+      // Parse AI report for dynamic headings and sections
       let heading = 'Site Inspection Report';
       let analysis = '';
-      if (report.voiceNote && report.voiceNote.elaboratedText) {
-        const lines = report.voiceNote.elaboratedText.split('\n').filter(l => l.trim() !== '');
+      if (report.aiReport) {
+        const lines = report.aiReport.split('\n').filter(l => l.trim() !== '');
         if (lines.length > 0) {
           heading = lines[0].replace(/\*/g, '').trim();
           analysis = lines.slice(1).join('\n');
         }
       }
-      doc.fontSize(25).font('Helvetica-Bold').text(heading, { align: 'center' });
-      doc.moveDown();
-      doc.fontSize(16).font('Helvetica-Bold').text(`Job:`, { continued: true }).font('Helvetica').text(` ${report.jobName}`);
-      doc.font('Helvetica-Bold').text(`Client:`, { continued: true }).font('Helvetica').text(` ${report.clientName}`);
-      doc.font('Helvetica-Bold').text(`Address:`, { continued: true }).font('Helvetica').text(` ${report.address}`);
-      doc.font('Helvetica-Bold').text(`Date:`, { continued: true }).font('Helvetica').text(` ${report.date}`);
-      doc.moveDown();
+      // Split AI output by photo section (assuming Gemini outputs one section per photo)
+      const photoSections = analysis.split(/Photo \d+:/).filter(Boolean);
 
-      // Reference Photos Section
-      if (report.photos && report.photos.length > 0) {
-        doc.addPage();
-        doc.fontSize(18).font('Helvetica-Bold').text('Reference Photos:', { underline: true });
-        doc.moveDown(0.5);
-        // Display photos in a grid (3 per row)
-        const photoSize = 170;
-        let x = doc.page.margins.left;
-        let y = doc.y;
-        let count = 0;
-        report.photos.forEach((photo, idx) => {
-          if (fs.existsSync(photo)) {
-            doc.image(photo, x, y, { width: photoSize, height: photoSize, align: 'center', valign: 'center' });
+      // --- Page 1: Cover + Photo Grid ---
+      doc.addPage();
+      addPageNumber(doc, 1, 3);
+      doc.fontSize(16).font('Helvetica-Bold').fillColor('#1a237e').text(heading, { align: 'center' });
+      doc.moveDown(0.5);
+      doc.fontSize(12).font('Helvetica').fillColor('#000').text(`Issue: ${heading}`, { align: 'center' });
+      doc.moveDown(1);
+      doc.fontSize(13).font('Helvetica-Bold').fillColor('#263238').text('Reference Photos:', { align: 'left' });
+      doc.moveDown(0.5);
+      // Photo grid (3 per row)
+      const photoSize = 120;
+      let x = doc.page.margins.left;
+      let y = doc.y;
+      let count = 0;
+      report.photos.forEach((photo, idx) => {
+        console.log('PDF: Trying to add photo:', photo.path);
+        try {
+          if (fs.existsSync(photo.path)) {
+            doc.image(photo.path, x, y, { width: photoSize, height: photoSize, align: 'center', valign: 'center' });
+            doc.rect(x, y, photoSize, photoSize).stroke('#90caf9');
+            doc.fontSize(9).fillColor('#263238').font('Helvetica').text(`Photo ${idx + 1}`, x, y + photoSize + 2, { width: photoSize, align: 'center' });
+          } else {
+            doc.fontSize(9).fillColor('#b71c1c').text(`Photo ${idx + 1} (missing)`, x, y + photoSize + 2, { width: photoSize, align: 'center' });
+            console.error('PDF: Photo file missing:', photo.path);
           }
-          x += photoSize + 10;
-          count++;
-          if (count % 3 === 0) {
-            x = doc.page.margins.left;
-            y += photoSize + 10;
+        } catch (e) {
+          doc.fontSize(9).fillColor('#b71c1c').text(`Photo ${idx + 1} (error)`, x, y + photoSize + 2, { width: photoSize, align: 'center' });
+          console.error('PDF: Error adding photo:', photo.path, e);
+        }
+        x += photoSize + 10;
+        count++;
+        if (count % 3 === 0) {
+          x = doc.page.margins.left;
+          y += photoSize + 30;
+        }
+      });
+      doc.moveDown(2);
+
+      // --- Page 2: Reference Photo Breakdown ---
+      doc.addPage();
+      addPageNumber(doc, 2, 3);
+      doc.fontSize(16).font('Helvetica-Bold').fillColor('#1a237e').text(heading, { align: 'center' });
+      doc.moveDown(0.5);
+      doc.fontSize(13).font('Helvetica-Bold').fillColor('#263238').text('Reference Photo breakdown:', { align: 'left' });
+      doc.moveDown(0.5);
+      report.photos.forEach((photo, idx) => {
+        doc.fontSize(12).font('Helvetica-Bold').fillColor('#263238').text(`Photo ${idx + 1}:`, { continued: false });
+        // Show the analysis for this photo
+        if (photoSections[idx]) {
+          let cleanText = photoSections[idx].replace(/\*/g, '').replace(/\n{2,}/g, '\n').trim();
+          cleanText.split('\n').forEach(line => {
+            if (/^\s*[-•]/.test(line)) {
+              doc.font('Helvetica-Bold').fontSize(11).fillColor('#000').text(line.trim(), { indent: 20 });
+            } else if (line.trim()) {
+              doc.font('Helvetica').fontSize(11).fillColor('#000').text(line.trim(), { indent: 10 });
+            }
+          });
+        } else {
+          doc.font('Helvetica').fontSize(11).fillColor('#b71c1c').text('No additional notes to be added.', { indent: 10 });
+        }
+        doc.moveDown(1);
+      });
+      doc.moveDown(1);
+
+      // --- Page 3: More Photos (if any), Recommended Services, Additional Notes ---
+      doc.addPage();
+      addPageNumber(doc, 3, 3);
+      // More photos if >9
+      if (report.photos.length > 9) {
+        let x2 = doc.page.margins.left;
+        let y2 = doc.y;
+        let count2 = 0;
+        for (let i = 9; i < report.photos.length; i++) {
+          console.log('PDF: Trying to add photo:', report.photos[i].path);
+          try {
+            if (fs.existsSync(report.photos[i].path)) {
+              doc.image(report.photos[i].path, x2, y2, { width: photoSize, height: photoSize, align: 'center', valign: 'center' });
+              doc.rect(x2, y2, photoSize, photoSize).stroke('#90caf9');
+              doc.fontSize(9).fillColor('#263238').font('Helvetica').text(`Photo ${i + 1}`, x2, y2 + photoSize + 2, { width: photoSize, align: 'center' });
+            } else {
+              doc.fontSize(9).fillColor('#b71c1c').text(`Photo ${i + 1} (missing)`, x2, y2 + photoSize + 2, { width: photoSize, align: 'center' });
+              console.error('PDF: Photo file missing:', report.photos[i].path);
+            }
+          } catch (e) {
+            doc.fontSize(9).fillColor('#b71c1c').text(`Photo ${i + 1} (error)`, x2, y2 + photoSize + 2, { width: photoSize, align: 'center' });
+            console.error('PDF: Error adding photo:', report.photos[i].path, e);
           }
-        });
+          x2 += photoSize + 10;
+          count2++;
+          if (count2 % 3 === 0) {
+            x2 = doc.page.margins.left;
+            y2 += photoSize + 30;
+          }
+        }
         doc.moveDown(2);
       }
-
-      // Reference Photo Analysis Section
-      if (analysis && report.photos && report.photos.length > 0) {
-        doc.addPage();
-        doc.fontSize(18).font('Helvetica-Bold').text('Photo Analysis', { underline: true });
-        doc.moveDown();
-        // Split Gemini output by photo section (assuming Gemini outputs one section per photo)
-        // We'll use 'Photo X:' as the delimiter
-        const photoSections = analysis.split(/Photo \d+:/).filter(Boolean);
-        report.photos.forEach((photo, idx) => {
-          const fname = photo.split(/[\\/]/).pop();
-          doc.fontSize(14).font('Helvetica-Bold').text(`Photo ${idx + 1}: ${fname}`);
-          doc.moveDown(0.2);
-          if (photoSections[idx]) {
-            // Remove any asterisks and extra whitespace
-            let cleanText = photoSections[idx].replace(/\*/g, '').replace(/\n{2,}/g, '\n').trim();
-            // Bold field labels (Problem Description, etc.)
-            const fields = ['Problem Description:', 'Recommended Solution:', 'Priority Level:', 'Estimated Cost Range:', 'Safety Concerns:'];
-            fields.forEach(field => {
-              cleanText = cleanText.replace(new RegExp(field, 'g'), `\n\u2022 ` + field);
-            });
-            // Split by lines and bold field labels
-            cleanText.split('\n').forEach(line => {
-              const match = fields.find(f => line.trim().startsWith('\u2022 ' + f));
-              if (match) {
-                doc.font('Helvetica-Bold').fontSize(12).text(line.trim(), { continued: false });
-              } else {
-                doc.font('Helvetica').fontSize(12).text(line.trim(), { continued: false });
-              }
-            });
-            doc.moveDown();
-          } else {
-            doc.font('Helvetica').fontSize(12).text('No analysis available for this photo.');
-            doc.moveDown();
+      // Recommended Services
+      doc.fontSize(13).font('Helvetica-Bold').fillColor('#263238').text('Recommended Services:', { underline: true });
+      doc.moveDown(0.5);
+      let recommended = '';
+      if (analysis.includes('Recommended Services:')) {
+        recommended = analysis.split('Recommended Services:')[1].split('Additional Notes:')[0] || '';
+      }
+      if (recommended.trim()) {
+        recommended.split('\n').forEach(line => {
+          if (/^\s*[-•]/.test(line)) {
+            doc.font('Helvetica-Bold').fontSize(11).fillColor('#000').text(line.trim(), { indent: 20 });
+          } else if (line.trim()) {
+            doc.font('Helvetica').fontSize(11).fillColor('#000').text(line.trim(), { indent: 10 });
           }
         });
+      } else {
+        doc.font('Helvetica').fontSize(11).fillColor('#b71c1c').text('No recommended services to be added.', { indent: 10 });
       }
-
-      // Recommended Services Section
-      doc.addPage();
-      doc.fontSize(18).font('Helvetica-Bold').text('Recommended Services:', { underline: true });
-      doc.moveDown();
-      doc.font('Helvetica').fontSize(12).text('Service recommendations will be listed here.');
-      doc.moveDown();
-
-      // Additional Notes Section
-      doc.fontSize(18).font('Helvetica-Bold').text('Additional Notes:', { underline: true });
-      doc.moveDown();
-      doc.font('Helvetica').fontSize(12).text('No additional project notes at this time.');
+      doc.moveDown(1);
+      // Additional Notes
+      doc.fontSize(13).font('Helvetica-Bold').fillColor('#263238').text('Additional Notes:', { underline: true });
+      doc.moveDown(0.5);
+      let notes = '';
+      if (analysis.includes('Additional Notes:')) {
+        notes = analysis.split('Additional Notes:')[1] || '';
+      }
+      if (notes.trim()) {
+        notes.split('\n').forEach(line => {
+          if (line.trim()) doc.font('Helvetica').fontSize(11).fillColor('#000').text(line.trim(), { indent: 10 });
+        });
+      } else {
+        doc.font('Helvetica').fontSize(11).fillColor('#b71c1c').text('No additional project notes at this time.', { indent: 10 });
+      }
 
       doc.end();
 
@@ -488,6 +496,46 @@ app.get('/api/reports/:id', (req, res) => {
   if (!report) {
     return res.status(404).json({ error: 'Report not found' });
   }
+  res.json(report);
+});
+
+// Endpoint to trigger AI analysis for a report
+app.post('/api/reports/:id/analyze', async (req, res) => {
+  try {
+    const report = reports.find(r => r.id === req.params.id);
+    if (!report) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+    // Only analyze if not already analyzed or if forced
+    if (report.aiReport && !req.body.force) {
+      return res.json({ aiReport: report.aiReport });
+    }
+    // Prepare photo descriptions for Gemini
+    const photoDescriptions = report.photos.map(photo => ({
+      description: photo.description,
+      type: photo.type,
+      transcription: photo.transcription
+    }));
+    const aiReport = await generateReportContent(photoDescriptions);
+    report.aiReport = aiReport;
+    res.json({ aiReport });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to analyze report', details: error.message });
+  }
+});
+
+// Endpoint to update a report (e.g., to save edited aiReport)
+app.patch('/api/reports/:id', (req, res) => {
+  const report = reports.find(r => r.id === req.params.id);
+  if (!report) {
+    return res.status(404).json({ error: 'Report not found' });
+  }
+  // Only update provided fields
+  Object.keys(req.body).forEach(key => {
+    if (key in report) {
+      report[key] = req.body[key];
+    }
+  });
   res.json(report);
 });
 
