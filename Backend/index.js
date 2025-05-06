@@ -168,16 +168,479 @@ async function generateReportContent(photoDescriptions = []) {
     const response = await result.response;
     const text = response.text();
     console.log('Report content generated successfully');
-    return text;
+    // Remove all asterisks from the AI report
+    const cleanedText = text.replace(/\*/g, '');
+    return cleanedText;
   } catch (error) {
     console.error('Error generating report content:', error);
     throw new Error('Failed to generate report content. Please try again.');
   }
 }
 
+// IMPROVED PDF GENERATION FUNCTION
+async function generateFormattedPDF(report, outputPath) {
+  return new Promise((resolve, reject) => {
+    try {
+      // Create a new PDF document with proper margins
+      const doc = new PDFDocument({
+        autoFirstPage: false,
+        margins: {
+          top: 50,
+          bottom: 50,
+          left: 50,
+          right: 50
+        },
+        size: 'A4'
+      });
+      
+      // Create a write stream
+      const writeStream = fs.createWriteStream(outputPath);
+      doc.pipe(writeStream);
+      
+      // Total pages (fixed at 3 for now, but could be dynamic)
+      const totalPages = 3;
+      
+      // Helper function for page numbers
+      function addPageNumber(doc, pageNum) {
+        doc.fontSize(10)
+           .fillColor('#333333')
+           .text(`Page ${pageNum} of ${totalPages}`, 
+                 doc.page.width - 100, 
+                 20, 
+                 { align: 'right' });
+      }
+      
+      // Helper function for consistent section headers
+      function addSectionHeader(doc, text) {
+        doc.fontSize(14)
+           .font('Helvetica-Bold')
+           .fillColor('#333333')
+           .text(text, { underline: false })
+           .moveDown(0.5);
+      }
+      
+      // Extract report title from AI report or use job name
+      let reportTitle = report.jobName || 'Property Inspection Report';
+      if (report.aiReport) {
+        const firstLine = report.aiReport.split('\n')[0].trim();
+        if (firstLine && firstLine.length > 10) {
+          reportTitle = firstLine;
+        }
+      }
+      
+      // --- PAGE 1: Title and Photo Grid ---
+      doc.addPage();
+      addPageNumber(doc, 1);
+      
+      // Title
+      const contentWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+      doc.x = doc.page.margins.left;
+      doc.fontSize(16)
+         .font('Helvetica-Bold')
+         .fillColor('#000000')
+         .text(reportTitle, doc.page.margins.left, doc.y, { width: contentWidth, align: 'center' })
+         .moveDown(1);
+      
+      // Issue statement
+      doc.x = doc.page.margins.left;
+      doc.fontSize(12)
+         .font('Helvetica')
+         .fillColor('#000000')
+         .text(`Issue: ${reportTitle}`, doc.page.margins.left, doc.y, { width: contentWidth, align: 'left' })
+         .moveDown(1);
+      
+      // Reference Photos heading
+      addSectionHeader(doc, 'Reference Photos:');
+      
+      // Photo grid (3 per row)
+      const photoSize = 120;
+      let x = doc.page.margins.left;
+      let y = doc.y;
+      let count = 0;
+      
+      // Only process up to 9 photos on first page
+      const firstPagePhotos = report.photos.slice(0, 9);
+      
+      firstPagePhotos.forEach((photo, idx) => {
+        try {
+          if (fs.existsSync(photo.path)) {
+            doc.image(photo.path, x, y, { 
+              width: photoSize, 
+              height: photoSize, 
+              fit: [photoSize, photoSize],
+              align: 'center', 
+              valign: 'center' 
+            });
+            // Add border around photo
+            doc.rect(x, y, photoSize, photoSize).stroke('#cccccc');
+          } else {
+            // Placeholder for missing photo
+            doc.rect(x, y, photoSize, photoSize).stroke('#cccccc');
+            doc.fontSize(9)
+               .fillColor('#cc0000')
+               .text('Photo not available', x + 10, y + photoSize/2, { 
+                 width: photoSize - 20, 
+                 align: 'center' 
+               });
+          }
+        } catch (e) {
+          // Error handling for photo loading issues
+          doc.rect(x, y, photoSize, photoSize).stroke('#cccccc');
+          doc.fontSize(9)
+             .fillColor('#cc0000')
+             .text('Error loading photo', x + 10, y + photoSize/2, { 
+               width: photoSize - 20, 
+               align: 'center' 
+             });
+          console.error('Error adding photo:', photo.path, e);
+        }
+        
+        // Add photo number below image
+        doc.fontSize(10)
+           .fillColor('#000000')
+           .font('Helvetica')
+           .text(`Photo ${idx + 1}`, x, y + photoSize + 5, { 
+             width: photoSize, 
+             align: 'center' 
+           });
+        
+        // Move to next position
+        x += photoSize + 20;
+        count++;
+        
+        // Move to next row after 3 photos
+        if (count % 3 === 0) {
+          x = doc.page.margins.left;
+          y += photoSize + 30;
+        }
+      });
+      
+      // Ensure we're at the bottom of the grid
+      if (count % 3 !== 0) {
+        y += photoSize + 30;
+      }
+      doc.y = y;
+      doc.x = doc.page.margins.left;
+      
+      // --- PAGE 2: Reference Photo breakdown ---
+      doc.addPage();
+      addPageNumber(doc, 2);
+      
+      // Title again for consistency
+      doc.x = doc.page.margins.left;
+      doc.fontSize(16)
+         .font('Helvetica-Bold')
+         .fillColor('#000000')
+         .text(reportTitle, doc.page.margins.left, doc.y, { width: contentWidth, align: 'center' })
+         .moveDown(1);
+      
+      // Reference Photo breakdown heading
+      addSectionHeader(doc, 'Reference Photo breakdown:');
+      
+      // Parse AI report for photo sections
+      let photoSections = [];
+      if (report.aiReport) {
+        // Try to extract photo sections using regex
+        const photoPattern = /Photo\s+\d+:/gi;
+        const matches = [...report.aiReport.matchAll(photoPattern)];
+        
+        if (matches.length > 0) {
+          for (let i = 0; i < matches.length; i++) {
+            const start = matches[i].index;
+            const end = (i < matches.length - 1) ? matches[i+1].index : report.aiReport.length;
+            const section = report.aiReport.substring(start, end).trim();
+            photoSections.push(section);
+          }
+        }
+      }
+      
+      // If we couldn't parse sections, use the photos array directly
+      if (photoSections.length === 0 && report.photos.length > 0) {
+        photoSections = report.photos.map((photo, idx) => {
+          return `Photo ${idx + 1}:\n${photo.description || 'No description provided.'}`;
+        });
+      }
+      
+      // Process each photo section
+      report.photos.forEach((photo, idx) => {
+        // Photo header with clear separation
+        doc.x = doc.page.margins.left;
+        doc.fontSize(12)
+           .font('Helvetica-Bold')
+           .fillColor('#000000')
+           .text(`Photo ${idx + 1}:`, doc.page.margins.left, doc.y, { width: contentWidth, align: 'left', underline: false })
+           .moveDown(0.3);
+        
+        // Find the corresponding section in the AI report
+        const section = photoSections[idx] || '';
+        
+        // If we have a section from AI, parse and format it
+        if (section) {
+          // Extract common fields using regex
+          const problemMatch = section.match(/Problem Description:(.+?)(?=Recommended Solution:|Priority Level:|Estimated Cost Range:|Safety Concerns:|$)/s);
+          const solutionMatch = section.match(/Recommended Solution:(.+?)(?=Problem Description:|Priority Level:|Estimated Cost Range:|Safety Concerns:|$)/s);
+          const priorityMatch = section.match(/Priority Level:(.+?)(?=Problem Description:|Recommended Solution:|Estimated Cost Range:|Safety Concerns:|$)/s);
+          const costMatch = section.match(/Estimated Cost Range:(.+?)(?=Problem Description:|Recommended Solution:|Priority Level:|Safety Concerns:|$)/s);
+          const safetyMatch = section.match(/Safety Concerns:(.+?)(?=Problem Description:|Recommended Solution:|Priority Level:|Estimated Cost Range:|$)/s);
+          
+          // Format and add each field if found
+          if (problemMatch && problemMatch[1]) {
+            doc.x = doc.page.margins.left;
+            doc.fontSize(11)
+               .font('Helvetica-Bold')
+               .fillColor('#000000')
+               .text('Problem Description:', { continued: true })
+               .font('Helvetica')
+               .text(problemMatch[1].replace(/\*/g, '').trim(), doc.page.margins.left, doc.y, { width: contentWidth, align: 'left' })
+               .moveDown(0.3);
+          }
+          
+          if (solutionMatch && solutionMatch[1]) {
+            doc.x = doc.page.margins.left;
+            doc.fontSize(11)
+               .font('Helvetica-Bold')
+               .fillColor('#000000')
+               .text('Recommended Solution:', { continued: true })
+               .font('Helvetica')
+               .text(solutionMatch[1].replace(/\*/g, '').trim(), doc.page.margins.left, doc.y, { width: contentWidth, align: 'left' })
+               .moveDown(0.3);
+          }
+          
+          if (priorityMatch && priorityMatch[1]) {
+            doc.x = doc.page.margins.left;
+            doc.fontSize(11)
+               .font('Helvetica-Bold')
+               .fillColor('#000000')
+               .text('Priority Level:', { continued: true })
+               .font('Helvetica')
+               .text(priorityMatch[1].replace(/\*/g, '').trim(), doc.page.margins.left, doc.y, { width: contentWidth, align: 'left' })
+               .moveDown(0.3);
+          }
+          
+          if (costMatch && costMatch[1]) {
+            doc.x = doc.page.margins.left;
+            doc.fontSize(11)
+               .font('Helvetica-Bold')
+               .fillColor('#000000')
+               .text('Estimated Cost Range:', { continued: true })
+               .font('Helvetica')
+               .text(costMatch[1].replace(/\*/g, '').trim(), doc.page.margins.left, doc.y, { width: contentWidth, align: 'left' })
+               .moveDown(0.3);
+          }
+          
+          if (safetyMatch && safetyMatch[1]) {
+            doc.x = doc.page.margins.left;
+            doc.fontSize(11)
+               .font('Helvetica-Bold')
+               .fillColor('#000000')
+               .text('Safety Concerns:', { continued: true })
+               .font('Helvetica')
+               .text(safetyMatch[1].replace(/\*/g, '').trim(), doc.page.margins.left, doc.y, { width: contentWidth, align: 'left' })
+               .moveDown(0.3);
+          }
+        } else {
+          // If no AI section, just show the description from the photo object
+          doc.x = doc.page.margins.left;
+          doc.fontSize(11)
+             .font('Helvetica-Bold')
+             .fillColor('#000000')
+             .text('Description:', { continued: true })
+             .font('Helvetica')
+             .text(photo.description || ' No description provided.', doc.page.margins.left, doc.y, { width: contentWidth, align: 'left' })
+             .moveDown(0.3);
+        }
+        
+        // Add space between photo sections
+        doc.moveDown(1);
+        
+        // Check if we need a page break (rough estimate)
+        if (doc.y > doc.page.height - 150 && idx < report.photos.length - 1) {
+          doc.addPage();
+          addPageNumber(doc, 2);
+          doc.x = doc.page.margins.left;
+          doc.fontSize(16)
+             .font('Helvetica-Bold')
+             .fillColor('#000000')
+             .text(reportTitle, doc.page.margins.left, doc.y, { width: contentWidth, align: 'center' })
+             .moveDown(1);
+          doc.fontSize(14)
+             .font('Helvetica-Bold')
+             .fillColor('#333333')
+             .text('Reference Photo breakdown (continued):', doc.page.margins.left, doc.y, { width: contentWidth, align: 'left', underline: false })
+             .moveDown(0.5);
+        }
+      });
+      
+      // --- PAGE 3: Recommended Services and Additional Notes ---
+      doc.addPage();
+      addPageNumber(doc, 3);
+      doc.x = doc.page.margins.left;
+      doc.fontSize(16)
+         .font('Helvetica-Bold')
+         .fillColor('#000000')
+         .text(reportTitle, doc.page.margins.left, doc.y, { width: contentWidth, align: 'center' })
+         .moveDown(1);
+      
+      // If we have more than 9 photos, show the rest here
+      if (report.photos.length > 9) {
+        addSectionHeader(doc, 'Additional Photos:');
+        
+        // Photo grid for remaining photos
+        let x2 = doc.page.margins.left;
+        let y2 = doc.y;
+        let count2 = 0;
+        
+        const remainingPhotos = report.photos.slice(9);
+        remainingPhotos.forEach((photo, idx) => {
+          const actualIdx = idx + 9; // Adjust index to account for first page photos
+          
+          try {
+            if (fs.existsSync(photo.path)) {
+              doc.image(photo.path, x2, y2, { 
+                width: photoSize, 
+                height: photoSize, 
+                fit: [photoSize, photoSize],
+                align: 'center', 
+                valign: 'center' 
+              });
+              // Add border around photo
+              doc.rect(x2, y2, photoSize, photoSize).stroke('#cccccc');
+            } else {
+              // Placeholder for missing photo
+              doc.rect(x2, y2, photoSize, photoSize).stroke('#cccccc');
+              doc.fontSize(9)
+                 .fillColor('#cc0000')
+                 .text('Photo not available', x2 + 10, y2 + photoSize/2, { 
+                   width: photoSize - 20, 
+                   align: 'center' 
+                 });
+            }
+          } catch (e) {
+            // Error handling for photo loading issues
+            doc.rect(x2, y2, photoSize, photoSize).stroke('#cccccc');
+            doc.fontSize(9)
+               .fillColor('#cc0000')
+               .text('Error loading photo', x2 + 10, y2 + photoSize/2, { 
+                 width: photoSize - 20, 
+                 align: 'center' 
+               });
+          }
+          
+          // Add photo number below image
+          doc.fontSize(10)
+             .fillColor('#000000')
+             .font('Helvetica')
+             .text(`Photo ${actualIdx + 1}`, x2, y2 + photoSize + 5, { 
+               width: photoSize, 
+               align: 'center' 
+             });
+          
+          // Move to next position
+          x2 += photoSize + 20;
+          count2++;
+          
+          // Move to next row after 3 photos
+          if (count2 % 3 === 0) {
+            x2 = doc.page.margins.left;
+            y2 += photoSize + 30;
+          }
+        });
+        
+        // Ensure we're at the bottom of the grid
+        if (count2 % 3 !== 0) {
+          y2 += photoSize + 30;
+        }
+        doc.y = y2;
+        doc.moveDown(1);
+      }
+      
+      // Recommended Services section
+      addSectionHeader(doc, 'Recommended Services:');
+      
+      // Extract recommended services from AI report
+      let recommendedServices = 'No recommended services to be added.';
+      if (report.aiReport && report.aiReport.includes('Recommended Services:')) {
+        const servicesSection = report.aiReport.split('Recommended Services:')[1];
+        if (servicesSection && servicesSection.includes('Additional Notes:')) {
+          recommendedServices = servicesSection.split('Additional Notes:')[0].trim();
+        } else if (servicesSection) {
+          recommendedServices = servicesSection.trim();
+        }
+      }
+      
+      // Format recommended services with bullet points if applicable
+      const serviceLines = recommendedServices.split('\n');
+      serviceLines.forEach(line => {
+        const trimmedLine = line.trim();
+        if (!trimmedLine) return;
+        
+        if (trimmedLine.startsWith('-') || trimmedLine.startsWith('•')) {
+          // This is a bullet point
+          doc.fontSize(11)
+             .font('Helvetica')
+             .fillColor('#000000')
+             .text(trimmedLine, { indent: 20 });
+        } else {
+          // Regular text
+          doc.fontSize(11)
+             .font('Helvetica')
+             .fillColor('#000000')
+             .text(trimmedLine);
+        }
+      });
+      
+      doc.moveDown(1);
+      
+      // Additional Notes section
+      addSectionHeader(doc, 'Additional Notes:');
+      
+      // Extract additional notes from AI report
+      let additionalNotes = 'No additional project notes at this time.';
+      if (report.aiReport && report.aiReport.includes('Additional Notes:')) {
+        additionalNotes = report.aiReport.split('Additional Notes:')[1].trim();
+        if (additionalNotes) {
+          // Format additional notes
+          doc.fontSize(11)
+             .font('Helvetica')
+             .fillColor('#000000')
+             .text(additionalNotes);
+        } else {
+          doc.fontSize(11)
+             .font('Helvetica')
+             .fillColor('#000000')
+             .text('No additional project notes at this time.');
+        }
+      } else {
+        doc.fontSize(11)
+           .font('Helvetica')
+           .fillColor('#000000')
+           .text('No additional project notes at this time.');
+      }
+      
+      // Finalize the PDF
+      doc.end();
+      
+      // Handle stream events
+      writeStream.on('finish', () => {
+        console.log('PDF created successfully at:', outputPath);
+        resolve(outputPath);
+      });
+      
+      writeStream.on('error', (err) => {
+        console.error('Error writing PDF:', err);
+        reject(err);
+      });
+      
+    } catch (error) {
+      console.error('Error generating PDF:', error);
+      reject(error);
+    }
+  });
+}
+
 // Endpoints
 // 1. Create new report
-app.post('/api/reports', upload.array('photos', 20), async (req, res) => {
+app.post('/api/reports', upload.fields([{ name: 'photos', maxCount: 20 }, { name: 'voices', maxCount: 20 }]), async (req, res) => {
   try {
     console.log('Received report creation request');
     console.log('Request body:', req.body);
@@ -195,44 +658,44 @@ app.post('/api/reports', upload.array('photos', 20), async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     // Enforce 1-20 photos
-    if (!req.files || req.files.length < 1 || req.files.length > 20) {
+    const photoFiles = req.files['photos'] || [];
+    const voiceFiles = req.files['voices'] || [];
+    if (photoFiles.length < 1 || photoFiles.length > 20) {
       return res.status(400).json({ error: 'You must upload between 1 and 20 photos.' });
     }
-    if (!Array.isArray(parsedDescriptions) || parsedDescriptions.length !== req.files.length) {
-      return res.status(400).json({ error: 'photoDescriptions array must match number of uploaded files.' });
+    if (!Array.isArray(parsedDescriptions) || parsedDescriptions.length !== photoFiles.length) {
+      return res.status(400).json({ error: 'photoDescriptions array must match number of uploaded images.' });
+    }
+    // Helper to find the voice file for a given voiceFile name
+    function findVoiceFile(voiceFileName) {
+      return voiceFiles.find(f => f.originalname === voiceFileName);
     }
     // Process each photo and its description
     const photos = [];
-    for (let idx = 0; idx < req.files.length; idx++) {
-      const f = req.files[idx];
+    for (let idx = 0; idx < photoFiles.length; idx++) {
+      const imageFile = photoFiles[idx];
       const desc = parsedDescriptions[idx] || {};
       let description = desc.description || '';
       let type = desc.type || 'text';
       let transcription = '';
-      // Validate file type matches description type
-      if (type === 'voice') {
-        if (!f.mimetype.startsWith('audio/')) {
-          return res.status(400).json({ error: `File ${f.originalname} is not an audio file but type is set to 'voice'.` });
+      // For voice notes, find and transcribe the audio file
+      if (type === 'voice' && desc.voiceFile) {
+        const audioFile = findVoiceFile(desc.voiceFile);
+        if (!audioFile) {
+          return res.status(400).json({ error: `Audio file ${desc.voiceFile} not found for photo at index ${idx}.` });
         }
-        // Transcribe the audio file
         try {
-          const fileBuffer = fs.readFileSync(f.path);
+          const fileBuffer = fs.readFileSync(audioFile.path);
           const transcriptResult = await speechToText(fileBuffer);
           transcription = transcriptResult.text || '';
           description = transcription;
         } catch (err) {
-          console.error('Error transcribing audio for photo', f.path, err);
+          console.error('Error transcribing audio for photo', audioFile.path, err);
           transcription = '';
         }
-      } else if (type === 'text') {
-        if (!f.mimetype.startsWith('image/')) {
-          return res.status(400).json({ error: `File ${f.originalname} is not an image file but type is set to 'text'.` });
-        }
-      } else {
-        return res.status(400).json({ error: `Invalid type for photo at index ${idx}. Must be 'voice' or 'text'.` });
       }
       photos.push({
-        path: f.path,
+        path: imageFile.path,
         description,
         type,
         transcription
@@ -258,7 +721,7 @@ app.post('/api/reports', upload.array('photos', 20), async (req, res) => {
   }
 });
 
-// 2. Generate PDF
+// 2. Generate PDF - UPDATED WITH IMPROVED PDF GENERATION
 app.get('/api/reports/:id/pdf', async (req, res) => {
   try {
     console.log('Generating PDF for report:', req.params.id);
@@ -270,184 +733,25 @@ app.get('/api/reports/:id/pdf', async (req, res) => {
     }
 
     console.log('Creating PDF document...');
-    const doc = new PDFDocument({ autoFirstPage: false });
     const pdfPath = path.join(__dirname, `report-${report.id}.pdf`);
-    const writeStream = fs.createWriteStream(pdfPath);
-
-    writeStream.on('error', (err) => {
-      console.error('Error writing PDF:', err);
-      res.status(500).json({ error: 'Failed to write PDF file' });
-    });
-
-    doc.pipe(writeStream);
-
-    // Helper for page numbers
-    function addPageNumber(doc, pageNum, totalPages) {
-      doc.fontSize(10).fillColor('#222').text(`Page ${pageNum} of ${totalPages}`, doc.page.width - 120, 20, { align: 'right' });
-    }
-
+    
     try {
-      // Parse AI report for dynamic headings and sections
-      let heading = 'Site Inspection Report';
-      let analysis = '';
-      if (report.aiReport) {
-        const lines = report.aiReport.split('\n').filter(l => l.trim() !== '');
-        if (lines.length > 0) {
-          heading = lines[0].replace(/\*/g, '').trim();
-          analysis = lines.slice(1).join('\n');
+      // Use the improved PDF generation function
+      await generateFormattedPDF(report, pdfPath);
+      
+      // Send the PDF as a download
+      res.download(pdfPath, `report-${report.id}.pdf`, (err) => {
+        if (err) {
+          console.error('Error sending PDF:', err);
+          res.status(500).json({ error: 'Failed to send PDF' });
         }
-      }
-      // Split AI output by photo section (assuming Gemini outputs one section per photo)
-      const photoSections = analysis.split(/Photo \d+:/).filter(Boolean);
-
-      // --- Page 1: Cover + Photo Grid ---
-      doc.addPage();
-      addPageNumber(doc, 1, 3);
-      doc.fontSize(16).font('Helvetica-Bold').fillColor('#1a237e').text(heading, { align: 'center' });
-      doc.moveDown(0.5);
-      doc.fontSize(12).font('Helvetica').fillColor('#000').text(`Issue: ${heading}`, { align: 'center' });
-      doc.moveDown(1);
-      doc.fontSize(13).font('Helvetica-Bold').fillColor('#263238').text('Reference Photos:', { align: 'left' });
-      doc.moveDown(0.5);
-      // Photo grid (3 per row)
-      const photoSize = 120;
-      let x = doc.page.margins.left;
-      let y = doc.y;
-      let count = 0;
-      report.photos.forEach((photo, idx) => {
-        console.log('PDF: Trying to add photo:', photo.path);
+        // Clean up the file after sending
         try {
-          if (fs.existsSync(photo.path)) {
-            doc.image(photo.path, x, y, { width: photoSize, height: photoSize, align: 'center', valign: 'center' });
-            doc.rect(x, y, photoSize, photoSize).stroke('#90caf9');
-            doc.fontSize(9).fillColor('#263238').font('Helvetica').text(`Photo ${idx + 1}`, x, y + photoSize + 2, { width: photoSize, align: 'center' });
-          } else {
-            doc.fontSize(9).fillColor('#b71c1c').text(`Photo ${idx + 1} (missing)`, x, y + photoSize + 2, { width: photoSize, align: 'center' });
-            console.error('PDF: Photo file missing:', photo.path);
-          }
-        } catch (e) {
-          doc.fontSize(9).fillColor('#b71c1c').text(`Photo ${idx + 1} (error)`, x, y + photoSize + 2, { width: photoSize, align: 'center' });
-          console.error('PDF: Error adding photo:', photo.path, e);
+          fs.unlinkSync(pdfPath);
+          console.log('Temporary PDF file deleted');
+        } catch (err) {
+          console.error('Error deleting temporary PDF:', err);
         }
-        x += photoSize + 10;
-        count++;
-        if (count % 3 === 0) {
-          x = doc.page.margins.left;
-          y += photoSize + 30;
-        }
-      });
-      // After grid, set doc.y to safe value for next content
-      doc.y = y + photoSize + 40;
-      doc.moveDown(2);
-
-      // --- Page 2: Reference Photo Breakdown ---
-      doc.addPage();
-      addPageNumber(doc, 2, 3);
-      doc.fontSize(16).font('Helvetica-Bold').fillColor('#1a237e').text(heading, { align: 'center' });
-      doc.moveDown(0.5);
-      doc.fontSize(13).font('Helvetica-Bold').fillColor('#263238').text('Reference Photo breakdown:', { align: 'left' });
-      doc.moveDown(0.5);
-      report.photos.forEach((photo, idx) => {
-        doc.fontSize(12).font('Helvetica-Bold').fillColor('#263238').text(`Photo ${idx + 1}:`, { continued: false });
-        // Show the analysis for this photo
-        if (photoSections[idx]) {
-          let cleanText = photoSections[idx].replace(/\*/g, '').replace(/\n{2,}/g, '\n').trim();
-          cleanText.split('\n').forEach(line => {
-            if (/^\s*[-•]/.test(line)) {
-              doc.font('Helvetica-Bold').fontSize(11).fillColor('#000').text(line.trim(), { indent: 20 });
-            } else if (line.trim()) {
-              doc.font('Helvetica').fontSize(11).fillColor('#000').text(line.trim(), { indent: 10 });
-            }
-          });
-        } else {
-          doc.font('Helvetica').fontSize(11).fillColor('#b71c1c').text('No additional notes to be added.', { indent: 10 });
-        }
-        doc.moveDown(1);
-      });
-      doc.moveDown(1);
-
-      // --- Page 3: More Photos (if any), Recommended Services, Additional Notes ---
-      doc.addPage();
-      addPageNumber(doc, 3, 3);
-      // More photos if >9
-      if (report.photos.length > 9) {
-        let x2 = doc.page.margins.left;
-        let y2 = doc.y;
-        let count2 = 0;
-        for (let i = 9; i < report.photos.length; i++) {
-          console.log('PDF: Trying to add photo:', report.photos[i].path);
-          try {
-            if (fs.existsSync(report.photos[i].path)) {
-              doc.image(report.photos[i].path, x2, y2, { width: photoSize, height: photoSize, align: 'center', valign: 'center' });
-              doc.rect(x2, y2, photoSize, photoSize).stroke('#90caf9');
-              doc.fontSize(9).fillColor('#263238').font('Helvetica').text(`Photo ${i + 1}`, x2, y2 + photoSize + 2, { width: photoSize, align: 'center' });
-            } else {
-              doc.fontSize(9).fillColor('#b71c1c').text(`Photo ${i + 1} (missing)`, x2, y2 + photoSize + 2, { width: photoSize, align: 'center' });
-              console.error('PDF: Photo file missing:', report.photos[i].path);
-            }
-          } catch (e) {
-            doc.fontSize(9).fillColor('#b71c1c').text(`Photo ${i + 1} (error)`, x2, y2 + photoSize + 2, { width: photoSize, align: 'center' });
-            console.error('PDF: Error adding photo:', report.photos[i].path, e);
-          }
-          x2 += photoSize + 10;
-          count2++;
-          if (count2 % 3 === 0) {
-            x2 = doc.page.margins.left;
-            y2 += photoSize + 30;
-          }
-        }
-        doc.moveDown(2);
-      }
-      // Recommended Services
-      doc.fontSize(13).font('Helvetica-Bold').fillColor('#263238').text('Recommended Services:', { underline: true });
-      doc.moveDown(0.5);
-      let recommended = '';
-      if (analysis.includes('Recommended Services:')) {
-        recommended = analysis.split('Recommended Services:')[1].split('Additional Notes:')[0] || '';
-      }
-      if (recommended.trim()) {
-        recommended.split('\n').forEach(line => {
-          if (/^\s*[-•]/.test(line)) {
-            doc.font('Helvetica-Bold').fontSize(11).fillColor('#000').text(line.trim(), { indent: 20 });
-          } else if (line.trim()) {
-            doc.font('Helvetica').fontSize(11).fillColor('#000').text(line.trim(), { indent: 10 });
-          }
-        });
-      } else {
-        doc.font('Helvetica').fontSize(11).fillColor('#b71c1c').text('No recommended services to be added.', { indent: 10 });
-      }
-      doc.moveDown(1);
-      // Additional Notes
-      doc.fontSize(13).font('Helvetica-Bold').fillColor('#263238').text('Additional Notes:', { underline: true });
-      doc.moveDown(0.5);
-      let notes = '';
-      if (analysis.includes('Additional Notes:')) {
-        notes = analysis.split('Additional Notes:')[1] || '';
-      }
-      if (notes.trim()) {
-        notes.split('\n').forEach(line => {
-          if (line.trim()) doc.font('Helvetica').fontSize(11).fillColor('#000').text(line.trim(), { indent: 10 });
-        });
-      } else {
-        doc.font('Helvetica').fontSize(11).fillColor('#b71c1c').text('No additional project notes at this time.', { indent: 10 });
-      }
-
-      doc.end();
-
-      writeStream.on('finish', () => {
-        console.log('PDF generated successfully:', pdfPath);
-        res.download(pdfPath, `report-${report.id}.pdf`, (err) => {
-          if (err) {
-            console.error('Error sending PDF:', err);
-            res.status(500).json({ error: 'Failed to send PDF' });
-          }
-          try {
-            fs.unlinkSync(pdfPath);
-            console.log('Temporary PDF file deleted');
-          } catch (err) {
-            console.error('Error deleting temporary PDF:', err);
-          }
-        });
       });
     } catch (err) {
       console.error('Error generating PDF content:', err);
@@ -471,6 +775,10 @@ app.post('/api/reports/:id/email', async (req, res) => {
       return res.status(404).json({ error: 'Report not found' });
     }
 
+    // Generate the PDF first
+    const pdfPath = path.join(__dirname, `report-${report.id}.pdf`);
+    await generateFormattedPDF(report, pdfPath);
+
     const mailOptions = {
       from: process.env.EMAIL_USER,
       to: email,
@@ -478,14 +786,24 @@ app.post('/api/reports/:id/email', async (req, res) => {
       text: `Please find attached the property report for ${report.jobName}.`,
       attachments: [{
         filename: `report-${report.id}.pdf`,
-        path: path.join(__dirname, `report-${report.id}.pdf`)
+        path: pdfPath
       }]
     };
 
     await transporter.sendMail(mailOptions);
+    
+    // Clean up the PDF file after sending
+    try {
+      fs.unlinkSync(pdfPath);
+      console.log('Temporary PDF file deleted after email sent');
+    } catch (err) {
+      console.error('Error deleting temporary PDF after email:', err);
+    }
+    
     res.json({ message: 'Email sent successfully' });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to send email' });
+    console.error('Error sending email:', error);
+    res.status(500).json({ error: 'Failed to send email', details: error.message });
   }
 });
 
