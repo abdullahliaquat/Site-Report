@@ -92,8 +92,10 @@ const storage = multer.diskStorage({
     cb(null, UPLOADS_DIR);
   },
   filename: function (req, file, cb) {
+    // Add original index to filename for uniqueness
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    const filename = uniqueSuffix + path.extname(file.originalname);
+    const idx = req.body && req.body.photoDescriptions ? JSON.parse(req.body.photoDescriptions).findIndex(desc => desc && desc.filename === file.originalname) : '';
+    const filename = uniqueSuffix + (idx !== '' ? `-${idx}` : '') + path.extname(file.originalname);
     console.log('Generated filename:', filename);
     cb(null, filename);
   }
@@ -334,6 +336,8 @@ app.get('/api/reports/:id/pdf', async (req, res) => {
           y += photoSize + 30;
         }
       });
+      // After grid, set doc.y to safe value for next content
+      doc.y = y + photoSize + 40;
       doc.moveDown(2);
 
       // --- Page 2: Reference Photo Breakdown ---
